@@ -18,16 +18,16 @@ import sys
 
 import torch
 
-from common.text.symbols import get_symbols, get_pad_idx
-from common.utils import DefaultAttrDict, AttrDict
+from common.text.symbols import get_pad_idx, get_symbols
+from common.utils import AttrDict, DefaultAttrDict
 from fastpitch.model import FastPitch
 from fastpitch.model_jit import FastPitchJIT
 from hifigan.models import Generator
 
 try:
-    from waveglow.model import WaveGlow
     from waveglow import model as glow
     from waveglow.denoiser import Denoiser
+    from waveglow.model import WaveGlow
     sys.modules['glow'] = glow
 except ImportError:
     print("WARNING: Couldn't import WaveGlow")
@@ -120,6 +120,7 @@ def get_model_config(model_name, args, ckpt_config=None):
             dur_predictor_filter_size=args.dur_predictor_filter_size,
             p_dur_predictor_dropout=args.p_dur_predictor_dropout,
             dur_predictor_n_layers=args.dur_predictor_n_layers,
+            dur_predictor_type=args.dur_predictor_type,
             # pitch predictor
             pitch_predictor_kernel_size=args.pitch_predictor_kernel_size,
             pitch_predictor_filter_size=args.pitch_predictor_filter_size,

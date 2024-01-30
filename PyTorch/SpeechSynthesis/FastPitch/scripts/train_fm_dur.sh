@@ -5,13 +5,14 @@ export OMP_NUM_THREADS=1
 : ${NUM_GPUS:=2}
 : ${BATCH_SIZE:=32}
 : ${GRAD_ACCUMULATION:=1}
-: ${OUTPUT_DIR:="./output_det"}
+: ${OUTPUT_DIR:="./output_fm"}
 : ${LOG_FILE:=$OUTPUT_DIR/nvlog.json}
 : ${DATASET_PATH:=data/LJSpeech-1.1}
 : ${TRAIN_FILELIST:=filelists/ljs_audio_pitch_text_train_v3.txt}
 : ${VAL_FILELIST:=filelists/ljs_audio_pitch_text_val.txt}
 : ${AMP:=false}
 : ${SEED:=""}
+: ${DUR_PRED_TYPE:="fm"}
 
 : ${LEARNING_RATE:=0.1}
 
@@ -70,6 +71,9 @@ ARGS+=" --kl-loss-warmup-epochs $KL_LOSS_WARMUP"
 ARGS+=" --text-cleaners $TEXT_CLEANERS"
 ARGS+=" --n-speakers $NSPEAKERS"
 
+
+ARGS+=" --dur-predictor-type $DUR_PRED_TYPE"
+
 [ "$AMP" = "true" ]                    && ARGS+=" --amp"
 [ "$PHONE" = "true" ]                  && ARGS+=" --p-arpabet 1.0"
 [ "$ENERGY" = "true" ]                 && ARGS+=" --energy-conditioning"
@@ -98,4 +102,4 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 : ${DISTRIBUTED:="-m torch.distributed.launch --nproc_per_node $NUM_GPUS"}
-CUDA_VISIBLE_DEVICES=1,2 python $DISTRIBUTED train.py $ARGS "$@"
+CUDA_VISIBLE_DEVICES=3,4 python $DISTRIBUTED train.py $ARGS "$@"

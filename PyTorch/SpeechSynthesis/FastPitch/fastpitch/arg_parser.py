@@ -97,6 +97,8 @@ def parse_fastpitch_args(parent, add_help=False):
                           help='Dropout probability for duration predictor')
     dur_pred.add_argument('--dur-predictor-n-layers', default=2, type=int,
                           help='Number of conv-1D layers')
+    dur_pred.add_argument('--dur-predictor-type', default="det", type=str, choices=["det", "fm"],
+                          help='Type of duration predictor')
 
     pitch_pred = parser.add_argument_group('pitch predictor parameters')
     pitch_pred.add_argument('--pitch-predictor-kernel-size', default=3, type=int,

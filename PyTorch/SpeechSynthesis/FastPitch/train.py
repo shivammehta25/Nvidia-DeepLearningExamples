@@ -29,28 +29,29 @@ import argparse
 import copy
 import os
 import time
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict, defaultdict
 from itertools import cycle
 
+import amp_C
 import numpy as np
 import torch
 import torch.distributed as dist
-import amp_C
-from apex.optimizers import FusedAdam, FusedLAMB
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 import common.tb_dllogger as logger
 import models
-from common.tb_dllogger import log
+from apex.optimizers import FusedAdam, FusedLAMB
 from common.repeated_dataloader import (RepeatedDataLoader,
                                         RepeatedDistributedSampler)
+from common.tb_dllogger import log
 from common.text import cmudict
 from common.utils import (BenchmarkStats, Checkpointer,
                           load_pretrained_weights, prepare_tmp)
 from fastpitch.attn_loss_function import AttentionBinarizationLoss
-from fastpitch.data_function import batch_to_gpu, ensure_disjoint, TTSCollate, TTSDataset
+from fastpitch.data_function import (TTSCollate, TTSDataset, batch_to_gpu,
+                                     ensure_disjoint)
 from fastpitch.loss_function import FastPitchLoss
 
 
@@ -69,7 +70,7 @@ def parse_args(parser):
                        help='Number of epochs per checkpoint')
     train.add_argument('--checkpoint-path', type=str, default=None,
                        help='Checkpoint path to resume training')
-    train.add_argument('--keep-milestones', default=list(range(100, 1000, 100)),
+    train.add_argument('--keep-milestones', default=list(range(0, 10000, 50)),
                        type=int, nargs='+',
                        help='Milestone checkpoints to keep from removing')
     train.add_argument('--resume', action='store_true',
@@ -369,6 +370,7 @@ def main():
     total_iter = train_state['total_iter']
 
     criterion = FastPitchLoss(
+        dur_predictor_type=args.dur_predictor_type,
         dur_predictor_loss_scale=args.dur_predictor_loss_scale,
         pitch_predictor_loss_scale=args.pitch_predictor_loss_scale,
         attn_loss_scale=args.attn_loss_scale)
@@ -377,7 +379,6 @@ def main():
 
     if args.local_rank == 0:
         prepare_tmp(args.pitch_online_dir)
-
     trainset = TTSDataset(audiopaths_and_text=args.training_files, **vars(args))
     valset = TTSDataset(audiopaths_and_text=args.validation_files, **vars(args))
     ensure_disjoint(trainset, valset)
@@ -443,7 +444,7 @@ def main():
                     if args.kl_loss_start_epoch == epoch and epoch_iter == 1:
                         print('Begin hard_attn loss')
 
-                    _, _, _, _, _, _, _, _, attn_soft, attn_hard, _, _ = y_pred
+                    _, _, _, _, _, _, _, _, attn_soft, attn_hard, _, _, _ = y_pred
                     binarization_loss = attention_kl_loss(attn_hard, attn_soft)
                     kl_weight = min((epoch - args.kl_loss_start_epoch) / args.kl_loss_warmup_epochs, 1.0) * args.kl_loss_weight
                     meta['kl_loss'] = binarization_loss.clone().detach() * kl_weight

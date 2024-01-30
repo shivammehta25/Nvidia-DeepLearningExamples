@@ -34,10 +34,11 @@ from fastpitch.attn_loss_function import AttentionCTCLoss
 
 
 class FastPitchLoss(nn.Module):
-    def __init__(self, dur_predictor_loss_scale=1.0,
+    def __init__(self, dur_predictor_type, dur_predictor_loss_scale=1.0,
                  pitch_predictor_loss_scale=1.0, attn_loss_scale=1.0,
                  energy_predictor_loss_scale=0.1):
         super(FastPitchLoss, self).__init__()
+        self.dur_predictor_type = dur_predictor_type
         self.dur_predictor_loss_scale = dur_predictor_loss_scale
         self.pitch_predictor_loss_scale = pitch_predictor_loss_scale
         self.energy_predictor_loss_scale = energy_predictor_loss_scale
@@ -47,7 +48,7 @@ class FastPitchLoss(nn.Module):
     def forward(self, model_out, targets, is_training=True, meta_agg='mean'):
         (mel_out, dec_mask, dur_pred, log_dur_pred, pitch_pred, pitch_tgt,
          energy_pred, energy_tgt, attn_soft, attn_hard, attn_dur,
-         attn_logprob) = model_out
+         attn_logprob, duration_loss) = model_out
 
         (mel_tgt, in_lens, out_lens) = targets
 
@@ -59,10 +60,16 @@ class FastPitchLoss(nn.Module):
         mel_tgt = mel_tgt.transpose(1, 2)
 
         dur_mask = mask_from_lens(dur_lens, max_len=dur_tgt.size(1))
-        log_dur_tgt = torch.log(dur_tgt.float() + 1)
-        loss_fn = F.mse_loss
-        dur_pred_loss = loss_fn(log_dur_pred, log_dur_tgt, reduction='none')
-        dur_pred_loss = (dur_pred_loss * dur_mask).sum() / dur_mask.sum()
+        
+        if self.dur_predictor_type == "det":
+            log_dur_tgt = torch.log(dur_tgt.float() + 1)
+            loss_fn = F.mse_loss
+            dur_pred_loss = loss_fn(log_dur_pred, log_dur_tgt, reduction='none')
+            dur_pred_loss = (dur_pred_loss * dur_mask).sum() / dur_mask.sum()
+        elif self.dur_predictor_type == "fm": 
+            dur_pred_loss = duration_loss
+        else:
+            raise ValueError(f"Unknown duration predictor type: {self.dur_predictor_type}")
 
         ldiff = mel_tgt.size(1) - mel_out.size(1)
         mel_out = F.pad(mel_out, (0, 0, 0, ldiff, 0, 0), value=0.0)
@@ -99,7 +106,7 @@ class FastPitchLoss(nn.Module):
             'pitch_loss': pitch_loss.clone().detach(),
             'attn_loss': attn_loss.clone().detach(),
             'dur_error': (torch.abs(dur_pred - dur_tgt).sum()
-                          / dur_mask.sum()).detach(),
+                          / dur_mask.sum()).detach() if dur_pred is not None else torch.zeros_like(attn_loss),
         }
 
         if energy_pred is not None:

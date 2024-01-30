@@ -7,7 +7,7 @@ export TORCH_CUDNN_V8_API_ENABLED=1
 : ${BATCH_SIZE:=32}
 : ${FILELIST:="phrases/devset10.tsv"}
 : ${AMP:=false}
-: ${TORCHSCRIPT:=true}
+: ${TORCHSCRIPT:=false}
 : ${WARMUP:=0}
 : ${REPEATS:=1}
 : ${CPU:=false}
@@ -15,8 +15,8 @@ export TORCH_CUDNN_V8_API_ENABLED=1
 : ${CUDNN_BENCHMARK:=false}
 
 # Paths to pre-trained models downloadable from NVIDIA NGC (LJSpeech-1.1)
-FASTPITCH_LJ="pretrained_models/fastpitch/nvidia_fastpitch_210824.pt"
-HIFIGAN_LJ="pretrained_models/hifigan/hifigan_gen_checkpoint_10000_ft.pt"
+FASTPITCH_LJ="output_fm/FastPitch_checkpoint_1000.pt"
+HIFIGAN_LJ="pretrained_models/hifigan/hifigan_gen_checkpoint_6500.pt"
 WAVEGLOW_LJ="pretrained_models/waveglow/nvidia_waveglow256pyt_fp16.pt"
 
 # Mel-spectrogram generator (optional; can synthesize from ground-truth spectrograms)
@@ -41,7 +41,7 @@ fi
 : ${DENOISING:=0.01}
 
 if [ ! -n "$OUTPUT_DIR" ]; then
-    OUTPUT_DIR="./output/audio_$(basename ${FILELIST} .tsv)"
+    OUTPUT_DIR="./output_fm_2/audio_$(basename ${FILELIST} .tsv)"
     [ "$AMP" = true ]     && OUTPUT_DIR+="_fp16"
     [ "$AMP" = false ]    && OUTPUT_DIR+="_fp32"
     [ -n "$FASTPITCH" ]   && OUTPUT_DIR+="_fastpitch"

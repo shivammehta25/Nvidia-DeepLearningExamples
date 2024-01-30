@@ -25,20 +25,21 @@
 #
 # *****************************************************************************
 
+import math
 from typing import Optional
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import pack, rearrange
 
 from common import filter_warnings
 from common.layers import ConvReLUNorm
 from common.utils import mask_from_lens
 from fastpitch.alignment import b_mas, mas_width1
 from fastpitch.attention import ConvAttention
-from fastpitch.transformer import FFTransformer
+from fastpitch.transformer import FFTransformer, PositionalEmbedding
 
 
 def regulate_len(durations, enc_out, pace: float = 1.0,
@@ -109,6 +110,237 @@ class TemporalPredictor(nn.Module):
         return out
 
 
+class TimestepEmbedding(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        time_embed_dim: int,
+        out_dim: int = None,
+        post_act_fn: Optional[str] = None,
+        cond_proj_dim=None,
+    ):
+        super().__init__()
+
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim)
+
+        if cond_proj_dim is not None:
+            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
+        else:
+            self.cond_proj = None
+
+        self.act =  nn.SiLU()
+
+        if out_dim is not None:
+            time_embed_dim_out = out_dim
+        else:
+            time_embed_dim_out = time_embed_dim
+        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out)
+
+        if post_act_fn is None:
+            self.post_act = None
+        else:
+            self.post_act = nn.SiLU()
+
+    def forward(self, sample, condition=None):
+        if condition is not None:
+            sample = sample + self.cond_proj(condition)
+        sample = self.linear_1(sample)
+
+        if self.act is not None:
+            sample = self.act(sample)
+
+        sample = self.linear_2(sample)
+
+        if self.post_act is not None:
+            sample = self.post_act(sample)
+        return sample
+    
+class SinusoidalPosEmb(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        assert self.dim % 2 == 0, "SinusoidalPosEmb requires dim to be even"
+
+    def forward(self, x, scale=1000):
+        if x.ndim < 1:
+            x = x.unsqueeze(0)
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
+        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+    
+    
+class LayerNorm(nn.Module):
+    def __init__(self, channels, eps=1e-4):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+
+        self.gamma = torch.nn.Parameter(torch.ones(channels))
+        self.beta = torch.nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        n_dims = len(x.shape)
+        mean = torch.mean(x, 1, keepdim=True)
+        variance = torch.mean((x - mean) ** 2, 1, keepdim=True)
+
+        x = (x - mean) * torch.rsqrt(variance + self.eps)
+
+        shape = [1, -1] + [1] * (n_dims - 2)
+        x = x * self.gamma.view(*shape) + self.beta.view(*shape)
+        return x
+
+class DurationPredictorNetworkWithTimeStep(nn.Module):
+    """Similar architecture but with a time embedding support"""
+
+    def __init__(self, in_channels, filter_channels, kernel_size, p_dropout):
+        super().__init__()
+        self.in_channels = in_channels
+        self.filter_channels = filter_channels
+        self.p_dropout = p_dropout
+
+        self.time_embeddings = SinusoidalPosEmb(filter_channels)
+        self.time_mlp = TimestepEmbedding(
+            in_channels=filter_channels,
+            time_embed_dim=filter_channels,
+        )
+
+        self.drop = torch.nn.Dropout(p_dropout)
+        self.conv_1 = torch.nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.norm_1 = LayerNorm(filter_channels)
+        self.conv_2 = torch.nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.norm_2 = LayerNorm(filter_channels)
+        self.proj = torch.nn.Conv1d(filter_channels, 1, 1)
+
+    def forward(self, x, x_mask, enc_outputs, t):
+        t = self.time_embeddings(t)
+        t = self.time_mlp(t).unsqueeze(-1)
+
+        x = pack([x, enc_outputs], "b * t")[0]
+
+        x = self.conv_1(x * x_mask)
+        x = torch.relu(x)
+        x = x + t
+        x = self.norm_1(x)
+        x = self.drop(x)
+        x = self.conv_2(x * x_mask)
+        x = torch.relu(x)
+        x = x + t
+        x = self.norm_2(x)
+        x = self.drop(x)
+        x = self.proj(x * x_mask)
+        return x * x_mask
+
+
+class FlowMatchingDurationPrediction(nn.Module):
+    def __init__(self, input_size, filter_size, kernel_size, dropout, sigma_min=1e-4, n_steps=10) -> None:
+        super().__init__()
+
+        self.estimator = DurationPredictorNetworkWithTimeStep(
+            in_channels=1 + input_size,
+            filter_channels=filter_size,
+            kernel_size=kernel_size,
+            p_dropout=dropout,
+        )
+        self.sigma_min = sigma_min
+        self.n_steps = n_steps
+
+    @torch.inference_mode()
+    def forward(self, enc_outputs, mask, n_timesteps=None, temperature=1):
+        """Forward diffusion
+
+        Args:
+            mu (torch.Tensor): output of encoder
+                shape: (batch_size, n_feats, mel_timesteps)
+            mask (torch.Tensor): output_mask
+                shape: (batch_size, 1, mel_timesteps)
+            n_timesteps (int): number of diffusion steps
+            temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
+            spks (torch.Tensor, optional): speaker ids. Defaults to None.
+                shape: (batch_size, spk_emb_dim)
+            cond: Not used but kept for future purposes
+
+        Returns:
+            sample: generated mel-spectrogram
+                shape: (batch_size, n_feats, mel_timesteps)
+        """
+        if n_timesteps is None:
+            n_timesteps = self.n_steps
+
+        b, _, t = enc_outputs.shape
+        z = torch.randn((b, 1, t), device=enc_outputs.device, dtype=enc_outputs.dtype) * temperature
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=enc_outputs.device)
+        return self.solve_euler(z, t_span=t_span, enc_outputs=enc_outputs, mask=mask)
+
+    def solve_euler(self, x, t_span, enc_outputs, mask):
+        """
+        Fixed euler solver for ODEs.
+        Args:
+            x (torch.Tensor): random noise
+            t_span (torch.Tensor): n_timesteps interpolated
+                shape: (n_timesteps + 1,)
+            mu (torch.Tensor): output of encoder
+                shape: (batch_size, n_feats, mel_timesteps)
+            mask (torch.Tensor): output_mask
+                shape: (batch_size, 1, mel_timesteps)
+            spks (torch.Tensor, optional): speaker ids. Defaults to None.
+                shape: (batch_size, spk_emb_dim)
+        """
+        t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
+
+        # I am storing this because I can later plot it by putting a debugger here and saving it to a file
+        # Or in future might add like a return_all_steps flag
+        sol = []
+
+        for step in range(1, len(t_span)):
+            dphi_dt = self.estimator(x, mask, enc_outputs, t)
+
+            x = x + dt * dphi_dt
+            t = t + dt
+            sol.append(x)
+            if step < len(t_span) - 1:
+                dt = t_span[step + 1] - t
+
+        return sol[-1]
+
+    def compute_loss(self, x1, enc_outputs, mask):
+        """Computes diffusion loss
+
+        Args:
+            x1 (torch.Tensor): Target
+                shape: (batch_size, n_feats, mel_timesteps)
+            mask (torch.Tensor): target mask
+                shape: (batch_size, 1, mel_timesteps)
+            mu (torch.Tensor): output of encoder
+                shape: (batch_size, n_feats, mel_timesteps)
+            spks (torch.Tensor, optional): speaker embedding. Defaults to None.
+                shape: (batch_size, spk_emb_dim)
+
+        Returns:
+            loss: conditional flow matching loss
+            y: conditional flow
+                shape: (batch_size, n_feats, mel_timesteps)
+        """
+        enc_outputs = enc_outputs.detach()  # don't update encoder from the duration predictor
+        b, _, t = enc_outputs.shape
+
+        # random timestep
+        t = torch.rand([b, 1, 1], device=enc_outputs.device, dtype=enc_outputs.dtype)
+        # sample noise p(x_0)
+        z = torch.randn_like(x1)
+
+        y = (1 - (1 - self.sigma_min) * t) * z + t * x1
+        u = x1 - (1 - self.sigma_min) * z
+
+        loss = F.mse_loss(self.estimator(y, mask, enc_outputs, t.squeeze()), u, reduction="sum") / (
+            torch.sum(mask) * u.shape[1]
+        )
+        return loss
+    
+    
 class FastPitch(nn.Module):
     def __init__(self, n_mel_channels, n_symbols, padding_idx,
                  symbols_embedding_dim, in_fft_n_layers, in_fft_n_heads,
@@ -121,7 +353,7 @@ class FastPitch(nn.Module):
                  out_fft_output_size,
                  p_out_fft_dropout, p_out_fft_dropatt, p_out_fft_dropemb,
                  dur_predictor_kernel_size, dur_predictor_filter_size,
-                 p_dur_predictor_dropout, dur_predictor_n_layers,
+                 p_dur_predictor_dropout, dur_predictor_n_layers, dur_predictor_type,
                  pitch_predictor_kernel_size, pitch_predictor_filter_size,
                  p_pitch_predictor_dropout, pitch_predictor_n_layers,
                  pitch_embedding_kernel_size,
@@ -151,13 +383,24 @@ class FastPitch(nn.Module):
         else:
             self.speaker_emb = None
         self.speaker_emb_weight = speaker_emb_weight
-
-        self.duration_predictor = TemporalPredictor(
+        
+        self.dur_predictor_type = dur_predictor_type 
+        if dur_predictor_type == "det":
+            self.duration_predictor = TemporalPredictor(
             in_fft_output_size,
             filter_size=dur_predictor_filter_size,
             kernel_size=dur_predictor_kernel_size,
             dropout=p_dur_predictor_dropout, n_layers=dur_predictor_n_layers
-        )
+         )
+        elif dur_predictor_type == "fm":
+            self.duration_predictor = FlowMatchingDurationPrediction(
+                in_fft_output_size,
+                filter_size=dur_predictor_filter_size,
+                kernel_size=dur_predictor_kernel_size,
+                dropout=p_dur_predictor_dropout 
+            )
+        else:
+            raise ValueError(f"Invalid duration predictor configuration: {self.name}")
 
         self.decoder = FFTransformer(
             n_layer=out_fft_n_layers, n_head=out_fft_n_heads,
@@ -265,8 +508,12 @@ class FastPitch(nn.Module):
         enc_out, enc_mask = self.encoder(inputs, conditioning=spk_emb)
 
         # Predict durations
-        log_dur_pred = self.duration_predictor(enc_out, enc_mask).squeeze(-1)
-        dur_pred = torch.clamp(torch.exp(log_dur_pred) - 1, 0, max_duration)
+        if self.dur_predictor_type == "det":
+            log_dur_pred = self.duration_predictor(enc_out, enc_mask).squeeze(-1)
+            # Output: (b, t, 1).squeeze(-1)
+            dur_pred = torch.clamp(torch.exp(log_dur_pred) - 1, 0, max_duration)
+        else:
+            log_dur_pred, dur_pred = None, None
 
         # Predict pitch
         pitch_pred = self.pitch_predictor(enc_out, enc_mask).permute(0, 2, 1)
@@ -289,6 +536,14 @@ class FastPitch(nn.Module):
         attn_hard_dur = attn_hard.sum(2)[:, 0, :]
         dur_tgt = attn_hard_dur
         assert torch.all(torch.eq(dur_tgt.sum(dim=1), mel_lens))
+        
+        if self.dur_predictor_type == "fm":
+            dur_tgt_ = rearrange(dur_tgt, "b t -> b () t")
+            enc_mask_ = rearrange(enc_mask, "b t 1 -> b 1 t")
+            enc_out_ = rearrange(enc_out, "b t d -> b d t")
+            duration_loss = self.duration_predictor.compute_loss(torch.log(1 + dur_tgt_.float()) * enc_mask_, enc_out_, enc_mask_)
+        else:
+            duration_loss = None
 
         # Average pitch over characters
         pitch_tgt = average_pitch(pitch_dense, dur_tgt)
@@ -322,7 +577,7 @@ class FastPitch(nn.Module):
         mel_out = self.proj(dec_out)
         return (mel_out, dec_mask, dur_pred, log_dur_pred, pitch_pred,
                 pitch_tgt, energy_pred, energy_tgt, attn_soft, attn_hard,
-                attn_hard_dur, attn_logprob)
+                attn_hard_dur, attn_logprob, duration_loss)
 
     def infer(self, inputs, pace=1.0, dur_tgt=None, pitch_tgt=None,
               energy_tgt=None, pitch_transform=None, max_duration=75,
@@ -340,7 +595,13 @@ class FastPitch(nn.Module):
         enc_out, enc_mask = self.encoder(inputs, conditioning=spk_emb)
 
         # Predict durations
-        log_dur_pred = self.duration_predictor(enc_out, enc_mask).squeeze(-1)
+        if self.dur_predictor_type == "det":
+            log_dur_pred = self.duration_predictor(enc_out, enc_mask).squeeze(-1)
+        else:
+            enc_mask_ = rearrange(enc_mask, "b t 1 -> b 1 t")
+            enc_out_ = rearrange(enc_out, "b t d -> b d t")
+            log_dur_pred = self.duration_predictor(enc_out_, enc_mask_).squeeze(-1)
+
         dur_pred = torch.clamp(torch.exp(log_dur_pred) - 1, 0, max_duration)
 
         # Pitch over chars
