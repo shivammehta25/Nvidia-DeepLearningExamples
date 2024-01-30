@@ -600,10 +600,9 @@ class FastPitch(nn.Module):
         else:
             enc_mask_ = rearrange(enc_mask, "b t 1 -> b 1 t")
             enc_out_ = rearrange(enc_out, "b t d -> b d t")
-            log_dur_pred = self.duration_predictor(enc_out_, enc_mask_).squeeze(-1)
+            log_dur_pred = self.duration_predictor(enc_out_, enc_mask_).squeeze(1)
 
         dur_pred = torch.clamp(torch.exp(log_dur_pred) - 1, 0, max_duration)
-
         # Pitch over chars
         pitch_pred = self.pitch_predictor(enc_out, enc_mask).permute(0, 2, 1)
 
